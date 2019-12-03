@@ -293,13 +293,15 @@ def run_multi_sphere_experiment(
     ics[phase_mask] *= partition_coefficent;
     normalization = np.mean(ics[bleach_mask])
     
+    pre_wall, pre_cpu = (time.perf_counter(), time.process_time())
     times, domain_solution = run_simulation(d_interior, d_exterior, partition_coefficent,
            phase_mask, bleach_mask, t_max, domain_height, domain_shape)
+    post_wall, post_cpu = (time.perf_counter(), time.process_time())
     post_process(times, domain_solution, phase_mask, bleach_mask,
         {'filename': filename, 'd_interior (um^2 / s)': d_interior, 'd_exterior (um^2 / s)': d_exterior
         ,'partition': partition_coefficent, 'number_spheres': num_spheres, 'sphere_sizes (um)': str(sizes)
         ,'bleach_radius (um)': bleach_radius, 't_max (s)': t_max, 'mesh_resolution': resolution
-        ,'normalization':normalization}, video)
+        ,'normalization':normalization, 'wall_time (s)': post_wall - pre_wall, 'cpu_time (s)': post_cpu - pre_cpu}, video)
    
 def single_expt():
     pre_wall, pre_cpu = (time.perf_counter(), time.process_time())
@@ -315,8 +317,6 @@ def single_expt():
     print('Wall time: {:.2f} sec, CPU time: {:.2f}'.format(post_wall - pre_wall, post_cpu - pre_cpu))
     
 if __name__ == '__main__':
-    pre_wall, pre_cpu = (time.perf_counter(), time.process_time())
-    for num_spheres in [1, 5, 10]:
-        run_multi_sphere_experiment(.1, 1, 50, num_spheres, 1, 1, 55, '{}_spheres'.format(num_spheres), True)
-    post_wall, post_cpu = (time.perf_counter(), time.process_time())
-    print('Wall time: {:.2f} sec, CPU time: {:.2f}'.format(post_wall - pre_wall, post_cpu - pre_cpu))
+    for repeat in itertools.count(start=0, step=1):
+        for num_spheres in [10, 5, 1]:
+            run_multi_sphere_experiment(.1, 1, 50, num_spheres, 1, .15, 55, '{}_spheres_repeat_{}'.format(num_spheres, repeat), True)

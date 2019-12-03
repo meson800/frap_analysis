@@ -11,6 +11,8 @@ import time
 import math
 import csv
 import os
+import random
+import itertools
 
 fe_diffusion_kernel = np.array(
          [[[0, 0, 0],
@@ -79,6 +81,41 @@ def generate_packed_sphere_mask(domain_shape, num_spheres, r_sphere, r_centers):
             n_placed += 1
     return total_mask
 
+def generate_bootstrap_sphere_mask(domain_shape, domain_height, r_bleach, num_spheres):
+    # First import condensate size
+    with open('condensate_size.csv') as f:
+        condensate_diameter = [float(l) / 1000 for l in f]
+    
+    # Monte carlo sample until we find a packing that works
+    converged = False
+    while ~converged:
+        sizes = np.array(random.choices(condensate_diameter, k=num_spheres))
+        radius_samples = np.sqrt(np.random.uniform(0, r_bleach**2, num_spheres));
+        angle_samples = np.random.uniform(0, 2 * np.pi, num_spheres);
+        x_samples = radius_samples * np.cos(angle_samples);
+        y_samples = radius_samples * np.sin(angle_samples);
+        
+        # check for rejection. Reject if sphere falls outside bleach radius
+        converged = np.all(radius_samples + sizes / 2 <= r_bleach);
+        
+        # Check to make sure spheres do not overlap
+        for (i,j) in itertools.product(range(num_spheres), repeat=2):
+            if i == j:
+                continue
+            intra_distance = np.sqrt((x_samples[i] - x_samples[j])**2 + (y_samples[i] - y_samples[j])**2)
+            if  intra_distance < (sizes[i] + sizes[j]) / 2:
+                    converged = False
+    # We have converged!
+    total_mask = np.zeros(domain_shape, dtype=bool)
+    real_to_idx = domain_shape[2] / domain_height;
+    for diameter, x, y in zip(sizes, x_samples, y_samples):
+        total_mask |= generate_sphere_mask(domain_shape,
+                   int(domain_shape[0] / 2 + (x * real_to_idx)),
+                   int(domain_shape[1] / 2 + (y * real_to_idx)),
+                   int(domain_shape[2] / 2),
+                   int(diameter * real_to_idx / 2))
+    return (total_mask, sizes)
+
 def generate_sphere_mask(domain_shape,x,y,z,r):
     """
     Given an (x,y,z) sphere point (in index units) and r (in index units),
@@ -112,6 +149,7 @@ def run_simulation(diffusion_interior, diffusion_exterior, partition_coeff,
     #width_spheres = int(domain_resolution * .7)
     ics = np.ones(domain_shape);
     ics[phase_mask] *= partition_coeff;
+    normalization_const = np.mean(ics[bleach_mask])
     ics[bleach_mask] = 0;
    #sphere_mask = generate_packed_sphere_mask(ics.shape, num_spheres, width_spheres / 2, int(1.3 *width_spheres))
     
@@ -120,12 +158,17 @@ def run_simulation(diffusion_interior, diffusion_exterior, partition_coeff,
                  di=diffusion_interior, de=diffusion_exterior, dr=dr, K=partition_coeff):
         return diffusion_1d(x, mask, K, di, de, dr, shape, bcs)
     
+    def terminate_cond(t, y):
+        print('{:.3f}'.format(np.mean(y.reshape(domain_shape)[bleach_mask]) / normalization_const))
+        return (np.mean(y.reshape(domain_shape)[bleach_mask]) / normalization_const) - .9
+    terminate_cond.terminal = True
+    
     results = scipy.integrate.solve_ivp(ivp_func, [0, t_max], ics.reshape((-1,)), method='RK23',
-                                        t_eval=np.linspace(0, t_max, 500));
+                                        t_eval=np.linspace(0, t_max, 500), events=terminate_cond);
     assert(results.success);
     return (results.t,results.y.reshape(domain_shape + (results.y.shape[1],)))
 
-def post_process(times, domain_solution, bleach_mask, options):
+def post_process(times, domain_solution, phase_mask, bleach_mask, options, video=False):
     """
     Options is expected as a dictionary of key/value pairs
     """
@@ -177,12 +220,31 @@ def post_process(times, domain_solution, bleach_mask, options):
         cmap = plt.cm.gray
         norm = plt.Normalize(vmin=0, vmax=np.max(domain_solution))
         bleach_norm = plt.Normalize()
+        phase_norm = plt.Normalize()
         image = cmap(norm(domain_solution[:,:,int(domain_solution.shape[2] / 2),0]))
         final_image = cmap(norm(domain_solution[:,:,int(domain_solution.shape[2] / 2),-1]))
         bleach_image = cmap(bleach_norm(bleach_mask[:,:,int(bleach_mask.shape[2] / 2)]))
+        phase_image = cmap(phase_norm(phase_mask[:,:,int(phase_mask.shape[2] / 2)]))
         plt.imsave(os.path.join('run_data' + runs_postfix, options['filename'] + '_start.png'),image)
         plt.imsave(os.path.join('run_data' + runs_postfix, options['filename'] + '_end.png'),final_image)
         plt.imsave(os.path.join('run_data' + runs_postfix, options['filename'] + '_bleach.png'),bleach_image)
+        plt.imsave(os.path.join('run_data' + runs_postfix, options['filename'] + '_phase.png'),phase_image)
+
+        if video:
+            fig, axes = plt.subplots(1,2, figsize=(10,5))
+            midpoint = int(domain_solution.shape[2] / 2)
+            im = axes[0].imshow(domain_solution[:,:,midpoint,0], 'gray',matplotlib.colors.Normalize(0,2), aspect='equal')
+            recovery_curve, = axes[1].plot(times, mean_recovery)
+            axes[1].set_title('Mean recovery inside spheres')
+            point, = axes[1].plot(0,mean_recovery[0], 'o')
+            axes[1].plot(times,mean_recovery, 'k', linewidth=.5, alpha=.4)
+            def animate_func(i):
+                im.set_array(domain_solution[:,:,midpoint,i])
+                recovery_curve.set_xdata(times[:i])
+                recovery_curve.set_ydata(mean_recovery[:i])
+                point.set_data(times[i], mean_recovery[i])
+            anim = FuncAnimation(fig,animate_func,frames=domain_solution.shape[3])
+            anim.save(os.path.join('run_data' + runs_postfix, options['filename'] + '_video.mp4'))
         
 def run_1d_sphere_experiment(
     d_interior, d_exterior, partition_coefficent,
@@ -205,21 +267,56 @@ def run_1d_sphere_experiment(
     
     times, domain_solution = run_simulation(d_interior, d_exterior, partition_coefficent,
            phase_mask, bleach_mask, t_max, domain_height, domain_shape)
-    post_process(times, domain_solution, bleach_mask,
+    post_process(times, domain_solution, phase_mask, bleach_mask,
         {'filename': filename, 'd_interior (um^2 / s)': d_interior, 'd_exterior (um^2 / s)': d_exterior
         ,'partition': partition_coefficent, 'sphere_diameter (um)': sphere_diameter
         ,'bleach_diameter (um)': bleach_diameter, 't_max (s)': t_max, 'mesh_resolution': resolution
         ,'normalization':normalization})
-
-if __name__ == '__main__':
+    
+def run_multi_sphere_experiment(
+    d_interior, d_exterior, partition_coefficent,
+    num_spheres, bleach_radius, t_max, resolution, filename, video=False):
+    """Given diffusion coefficents measured in square microns and diameters in microns"""
+    domain_shape = (resolution * 3, resolution * 3, resolution)
+    # make the domain height 1 micron
+    domain_height = 1;
+    
+    bleach_index_radius = int(resolution * bleach_radius)
+    
+    phase_mask, sizes = generate_bootstrap_sphere_mask(domain_shape,
+                              domain_height, bleach_radius, num_spheres)
+    
+    bleach_mask = generate_cylinder_mask(domain_shape,
+         int(domain_shape[0] / 2), int(domain_shape[1] / 2), bleach_index_radius)
+    
+    ics = np.ones(domain_shape);
+    ics[phase_mask] *= partition_coefficent;
+    normalization = np.mean(ics[bleach_mask])
+    
+    times, domain_solution = run_simulation(d_interior, d_exterior, partition_coefficent,
+           phase_mask, bleach_mask, t_max, domain_height, domain_shape)
+    post_process(times, domain_solution, phase_mask, bleach_mask,
+        {'filename': filename, 'd_interior (um^2 / s)': d_interior, 'd_exterior (um^2 / s)': d_exterior
+        ,'partition': partition_coefficent, 'number_spheres': num_spheres, 'sphere_sizes (um)': str(sizes)
+        ,'bleach_radius (um)': bleach_radius, 't_max (s)': t_max, 'mesh_resolution': resolution
+        ,'normalization':normalization}, video)
+   
+def single_expt():
     pre_wall, pre_cpu = (time.perf_counter(), time.process_time())
     for idx1, diameter in enumerate(np.arange(.7,.1,-.2)):
-        for idx2, d_exterior in enumerate([1,10]):
+        for idx2, d_exterior in enumerate([10]):
             for idx3, d_interior in enumerate([.1,.01]):
                     for idx4, k in enumerate([2, 10, 50, 100]):
-                        run_1d_sphere_experiment(d_interior, d_exterior, k, diameter, diameter, .3 / d_interior, 45,
+                        run_1d_sphere_experiment(d_interior, d_exterior, k, diameter, diameter, .15 / d_interior, 45,
                                  'equal_bleach_sphere_diameter_{}_{}_{}_{}'.format(idx1,idx2,idx3,idx4))
                         print('.',flush=True,end="")
     print('\n')
+    post_wall, post_cpu = (time.perf_counter(), time.process_time())
+    print('Wall time: {:.2f} sec, CPU time: {:.2f}'.format(post_wall - pre_wall, post_cpu - pre_cpu))
+    
+if __name__ == '__main__':
+    pre_wall, pre_cpu = (time.perf_counter(), time.process_time())
+    for num_spheres in [1, 5, 10]:
+        run_multi_sphere_experiment(.1, 1, 50, num_spheres, 1, 1, 55, '{}_spheres'.format(num_spheres), True)
     post_wall, post_cpu = (time.perf_counter(), time.process_time())
     print('Wall time: {:.2f} sec, CPU time: {:.2f}'.format(post_wall - pre_wall, post_cpu - pre_cpu))

@@ -69,17 +69,30 @@ def generate_packed_sphere_mask(domain_shape, num_spheres, r_sphere, r_centers):
     y_start = domain_shape[1] / 2 - (vert_offset * (-1/2 + num_rows / 2));
     
     total_mask = np.zeros(domain_shape, dtype=bool)
+    x_vals = []
+    y_vals = []
+    cylinder_masks = []
+    sphere_masks = []
     n_placed = 0;
     for i in range(num_rows):
         for x_offset in x_offsets:
             if n_placed < num_spheres:
+                x_val = int(x_offset + x_start + (horz_offset * (i % 2)))
+                y_val = int(y_start + vert_offset * i)
+                z_val = int(domain_shape[2] / 2)
+                x_vals.append(x_val)
+                y_vals.append(y_val)
                 total_mask |= generate_sphere_mask(domain_shape,
-                           int(x_offset + x_start + (horz_offset * (i % 2))),
-                           int(y_start + vert_offset * i),
-                           int(domain_shape[2] / 2),
-                           r_sphere);
+                           x_val, y_val, z_val, r_sphere)
+                cylinder_masks.append(generate_cylinder_mask(domain_shape,
+                            x_val, y_val, r_sphere))
+                sphere_masks.append(generate_sphere_mask(domain_shape,
+                            x_val, y_val, z_val, r_sphere))
             n_placed += 1
-    return total_mask
+    
+    return (total_mask, np.sqrt(np.power(np.array(x_vals) ,2) +
+                                np.power(np.array(y_vals), 2)),
+            np.tan(np.array(x_vals) / np.array(y_vals)), cylinder_masks, sphere_masks)
 
 def generate_bootstrap_sphere_mask(domain_shape, domain_height, r_bleach, num_spheres):
     # First import condensate size
@@ -108,13 +121,24 @@ def generate_bootstrap_sphere_mask(domain_shape, domain_height, r_bleach, num_sp
     # We have converged!
     total_mask = np.zeros(domain_shape, dtype=bool)
     real_to_idx = domain_shape[2] / domain_height;
+    cylinder_masks = []
+    sphere_masks = []
     for diameter, x, y in zip(sizes, x_samples, y_samples):
         total_mask |= generate_sphere_mask(domain_shape,
                    int(domain_shape[0] / 2 + (x * real_to_idx)),
                    int(domain_shape[1] / 2 + (y * real_to_idx)),
                    int(domain_shape[2] / 2),
                    int(diameter * real_to_idx / 2))
-    return (total_mask, sizes)
+        cylinder_masks.append(generate_cylinder_mask(domain_shape,
+                    int(domain_shape[0] / 2 + (x * real_to_idx)),
+                    int(domain_shape[1] / 2 + (y * real_to_idx)),
+                    int(diameter * real_to_idx / 2)))
+        sphere_masks.append(generate_sphere_mask(domain_shape,
+                   int(domain_shape[0] / 2 + (x * real_to_idx)),
+                   int(domain_shape[1] / 2 + (y * real_to_idx)),
+                   int(domain_shape[2] / 2),
+                   int(diameter * real_to_idx / 2)))
+    return (total_mask, sizes, radius_samples, angle_samples, cylinder_masks, sphere_masks)
 
 def generate_sphere_mask(domain_shape,x,y,z,r):
     """
@@ -164,11 +188,12 @@ def run_simulation(diffusion_interior, diffusion_exterior, partition_coeff,
     terminate_cond.terminal = True
     
     results = scipy.integrate.solve_ivp(ivp_func, [0, t_max], ics.reshape((-1,)), method='RK23',
-                                        t_eval=np.linspace(0, t_max, 500), events=terminate_cond);
+                                        t_eval=np.linspace(0, t_max, 600), events=terminate_cond);
     assert(results.success);
     return (results.t,results.y.reshape(domain_shape + (results.y.shape[1],)))
 
-def post_process(times, domain_solution, phase_mask, bleach_mask, options, video=False):
+def post_process(times, domain_solution, phase_mask, bleach_mask,
+                 average_masks, average_names, norms, options, video=False):
     """
     Options is expected as a dictionary of key/value pairs
     """
@@ -194,7 +219,10 @@ def post_process(times, domain_solution, phase_mask, bleach_mask, options, video
                         runs_postfix = '_' + str(int(runs_postfix[1:]) + 1)
                 else:
                     success = True
-    mean_recovery = [np.mean((domain_solution[:,:,:,i])[bleach_mask]) for i in range(domain_solution.shape[3])]
+    
+    recoveries = np.array([[np.mean((domain_solution[:,:,:,i])[mask]) / norms[j]
+                            for i in range(domain_solution.shape[3])]
+                     for j, mask in enumerate(average_masks)])
     
     if not os.path.exists('run_data' + runs_postfix):
         os.mkdir('run_data' + runs_postfix)
@@ -212,9 +240,9 @@ def post_process(times, domain_solution, phase_mask, bleach_mask, options, video
         runs_writer = csv.DictWriter(runs, field_names)
         data_writer = csv.writer(data)
         runs_writer.writerow(options);
-        data_writer.writerow(['t', 'Mean concentration'])
-        for time, mean in zip(times, mean_recovery):
-            data_writer.writerow([time, mean])
+        data_writer.writerow(['t'] + average_names)
+        for i, time in enumerate(times):
+            data_writer.writerow([time] + list(recoveries[:,i]))
         
         # Now save a picture of the domain
         cmap = plt.cm.gray
@@ -231,20 +259,23 @@ def post_process(times, domain_solution, phase_mask, bleach_mask, options, video
         plt.imsave(os.path.join('run_data' + runs_postfix, options['filename'] + '_phase.png'),phase_image)
 
         if video:
-            fig, axes = plt.subplots(1,2, figsize=(10,5))
+            fig, axes = plt.subplots(1,2, figsize=(15,5))
             midpoint = int(domain_solution.shape[2] / 2)
             im = axes[0].imshow(domain_solution[:,:,midpoint,0], 'gray',matplotlib.colors.Normalize(0,2), aspect='equal')
-            recovery_curve, = axes[1].plot(times, mean_recovery)
-            axes[1].set_title('Mean recovery inside spheres')
-            point, = axes[1].plot(0,mean_recovery[0], 'o')
-            axes[1].plot(times,mean_recovery, 'k', linewidth=.5, alpha=.4)
+            recovery_curves = axes[1].plot(times, recoveries.T)
+            axes[1].set_title('Recovery')
+            point, = axes[1].plot(0,recoveries[0,0], 'ko')
+            axes[1].plot(times, recoveries.T, 'k', linewidth=.5, alpha=.4)
+            axes[1].legend(average_names)
             def animate_func(i):
                 im.set_array(domain_solution[:,:,midpoint,i])
-                recovery_curve.set_xdata(times[:i])
-                recovery_curve.set_ydata(mean_recovery[:i])
-                point.set_data(times[i], mean_recovery[i])
+                for j in range(len(recovery_curves)):
+                    recovery_curves[j].set_xdata(times[:i])
+                    recovery_curves[j].set_ydata(recoveries[j,:i])
+                point.set_data(times[i], recoveries[0,i])
             anim = FuncAnimation(fig,animate_func,frames=domain_solution.shape[3])
             anim.save(os.path.join('run_data' + runs_postfix, options['filename'] + '_video.mp4'))
+            plt.close(fig)
         
 def run_1d_sphere_experiment(
     d_interior, d_exterior, partition_coefficent,
@@ -283,7 +314,7 @@ def run_multi_sphere_experiment(
     
     bleach_index_radius = int(resolution * bleach_radius)
     
-    phase_mask, sizes = generate_bootstrap_sphere_mask(domain_shape,
+    phase_mask, sizes, radii, angles, cylinders, spheres = generate_bootstrap_sphere_mask(domain_shape,
                               domain_height, bleach_radius, num_spheres)
     
     bleach_mask = generate_cylinder_mask(domain_shape,
@@ -291,17 +322,66 @@ def run_multi_sphere_experiment(
     
     ics = np.ones(domain_shape);
     ics[phase_mask] *= partition_coefficent;
-    normalization = np.mean(ics[bleach_mask])
+    normalizations = [np.mean(ics[mask]) for mask in [bleach_mask] + cylinders + spheres]
     
     pre_wall, pre_cpu = (time.perf_counter(), time.process_time())
     times, domain_solution = run_simulation(d_interior, d_exterior, partition_coefficent,
            phase_mask, bleach_mask, t_max, domain_height, domain_shape)
     post_wall, post_cpu = (time.perf_counter(), time.process_time())
     post_process(times, domain_solution, phase_mask, bleach_mask,
+                 [bleach_mask] + cylinders + spheres, 
+                 ['Bleach spot'] + ['C{}'.format(i) for i in range(len(cylinders))] +
+                 ['S{}'.format(i) for i in range(len(cylinders))],
+                 normalizations,
         {'filename': filename, 'd_interior (um^2 / s)': d_interior, 'd_exterior (um^2 / s)': d_exterior
-        ,'partition': partition_coefficent, 'number_spheres': num_spheres, 'sphere_sizes (um)': str(sizes)
+        ,'partition': partition_coefficent, 'number_spheres': num_spheres,
+         'sphere_sizes (um)': str(sizes), 'sphere_center_radius (um)': str(radii),
+         'sphere_center_angle (radians)': str(angles)
         ,'bleach_radius (um)': bleach_radius, 't_max (s)': t_max, 'mesh_resolution': resolution
-        ,'normalization':normalization, 'wall_time (s)': post_wall - pre_wall, 'cpu_time (s)': post_cpu - pre_cpu}, video)
+        ,'normalizations':normalizations,
+         'wall_time (s)': post_wall - pre_wall, 'cpu_time (s)': post_cpu - pre_cpu}, video)
+    
+def run_equal_multi_sphere_experiment(
+    d_interior, d_exterior, partition_coefficent,
+    bleach_radius, num_spheres, sphere_radius, sphere_spacing, 
+    t_max, resolution, filename, video=False):
+    """Given diffusion coefficents measured in square microns and diameters in microns"""
+    domain_shape = (resolution * 3, resolution * 3, resolution)
+    # make the domain height 1 micron
+    domain_height = 1;
+    
+    bleach_index_radius = int(resolution * bleach_radius)
+    sphere_index_radius = int(resolution * sphere_radius)
+    sphere_index_spacing = int(resolution * sphere_spacing)
+    
+    phase_mask, radii, angles, cylinders, spheres = generate_packed_sphere_mask(domain_shape,
+                              num_spheres, sphere_index_radius, sphere_index_spacing)
+    radii /= resolution;
+    sizes = np.ones((num_spheres,)) * sphere_radius * 2;
+    
+    bleach_mask = generate_cylinder_mask(domain_shape,
+         int(domain_shape[0] / 2), int(domain_shape[1] / 2), bleach_index_radius)
+    
+    ics = np.ones(domain_shape);
+    ics[phase_mask] *= partition_coefficent;
+    normalizations = [np.mean(ics[mask]) for mask in [bleach_mask] + cylinders + spheres]
+    
+    pre_wall, pre_cpu = (time.perf_counter(), time.process_time())
+    times, domain_solution = run_simulation(d_interior, d_exterior, partition_coefficent,
+           phase_mask, bleach_mask, t_max, domain_height, domain_shape)
+    post_wall, post_cpu = (time.perf_counter(), time.process_time())
+    post_process(times, domain_solution, phase_mask, bleach_mask,
+                 [bleach_mask] + cylinders + spheres, 
+                 ['Bleach spot'] + ['C{}'.format(i) for i in range(len(cylinders))] +
+                 ['S{}'.format(i) for i in range(len(cylinders))],
+                 normalizations,
+        {'filename': filename, 'd_interior (um^2 / s)': d_interior, 'd_exterior (um^2 / s)': d_exterior
+        ,'partition': partition_coefficent, 'number_spheres': num_spheres,
+         'sphere_sizes (um)': str(sizes), 'sphere_center_radius (um)': str(radii),
+         'sphere_center_angle (radians)': str(angles)
+        ,'bleach_radius (um)': bleach_radius, 't_max (s)': t_max, 'mesh_resolution': resolution
+        ,'normalizations':normalizations,
+         'wall_time (s)': post_wall - pre_wall, 'cpu_time (s)': post_cpu - pre_cpu}, video)
    
 def single_expt():
     pre_wall, pre_cpu = (time.perf_counter(), time.process_time())
@@ -316,7 +396,15 @@ def single_expt():
     post_wall, post_cpu = (time.perf_counter(), time.process_time())
     print('Wall time: {:.2f} sec, CPU time: {:.2f}'.format(post_wall - pre_wall, post_cpu - pre_cpu))
     
-if __name__ == '__main__':
+def run_random_expt():
     for repeat in itertools.count(start=0, step=1):
-        for num_spheres in [10, 5, 1]:
+        for num_spheres in [9, 6, 3]:
             run_multi_sphere_experiment(.1, 1, 50, num_spheres, 1, .15, 55, '{}_spheres_repeat_{}'.format(num_spheres, repeat), True)
+    
+if __name__ == '__main__':
+    for num_spheres in [9, 6, 3]:
+        for sphere_diameter in [.1, .2, .3, .4]:
+            for sphere_spacing in np.arange(sphere_diameter + .05, .45, .1):
+                run_equal_multi_sphere_experiment(.1, 1, 50, 1, num_spheres,
+                                 sphere_diameter / 2, sphere_spacing, .15, 55,
+                                '{}_spheres_diameter_{}_{}'.format(num_spheres, sphere_diameter, sphere_spacing), True)
